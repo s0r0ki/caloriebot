@@ -1,308 +1,322 @@
-import asyncio
-import logging
-import json
 import os
-from datetime import datetime, time, timedelta
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-import pytz
+import json
 import random
+from datetime import datetime
 
-logging.basicConfig(level=logging.INFO)
+import pytz
+from aiogram import Bot, Dispatcher, types
+from aiogram.utils import executor
+from aiogram.dispatcher.filters import Command
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
+TOKEN = os.getenv("BOT_TOKEN")
 
-DATA_FILE = "calories.json"
-TZ = pytz.timezone("Europe/Moscow")
+bot = Bot(token=TOKEN, parse_mode="HTML")
+dp = Dispatcher(bot)
+
+DATA_FILE = "data.json"
+DEFAULT_LIMIT = 2000
+TZ = pytz.timezone("Asia/Yerevan")  # можно сменить при желании
+
+# ---------- ХРАНИЛИЩЕ ДАННЫХ ----------
+
+user_limits = {}         # { user_id: limit }
+daily_calories = {}      # { date_str: { user_id: used } }
 
 
 def load_data():
+    """Читаем лимиты и калории из файла при старте."""
+    global user_limits, daily_calories
     if not os.path.exists(DATA_FILE):
-        return {}
-    with open(DATA_FILE, "r") as f:
-        return json.load(f)
+        user_limits = {}
+        daily_calories = {}
+        return
+
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+    except Exception:
+        # если файл побился — начинаем с чистого листа
+        user_limits = {}
+        daily_calories = {}
+        return
+
+    limits_raw = raw.get("limits", {})
+    daily_raw = raw.get("daily", {})
+
+    user_limits = {int(uid): int(limit) for uid, limit in limits_raw.items()}
+
+    daily_calories = {}
+    for date_str, per_day in daily_raw.items():
+        daily_calories[date_str] = {int(uid): int(val) for uid, val in per_day.items()}
 
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def save_data():
+    """Сохраняем лимиты и калории в файл после каждого изменения."""
+    raw = {
+        "limits": {str(uid): limit for uid, limit in user_limits.items()},
+        "daily": {
+            date_str: {str(uid): val for uid, val in per_day.items()}
+            for date_str, per_day in daily_calories.items()
+        },
+    }
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(raw, f, ensure_ascii=False)
 
 
-def get_today():
-    return datetime.now(TZ).strftime("%Y-%m-%d")
+def today_key():
+    now = datetime.now(TZ)
+    return now.strftime("%Y-%m-%d")
 
 
-# ------------------------------
-#     РЕАКЦИИ НА ОБЪЁМ ЕДЫ
-# ------------------------------
-
-MEAL_REACTIONS = {
-    "tiny": [
-        "Это было не еда, а тест-драйв.",
-        "Перекус-призрак.",
-        "Лимит даже не заметил.",
-        "Так ест человек с характером.",
-        "Можно считать, что «ничего не было».",
-        "Организм такой: «и всё?»",
-        "Диета довольно улыбается.",
-        "Аккуратненько, красиво.",
-        "Лёгкий шаг, а не еда.",
-        "Просто размял желудок.",
-    ],
-    "light": [
-        "Лёгкий заход, лимит не в стрессе.",
-        "Нормальный скромный приём.",
-        "Поел — но без последствий.",
-        "Чистый, спокойный ход.",
-        "Пока всё под контролем.",
-        "Диета не напрягается.",
-        "Умерено, приятно, не страшно.",
-        "Типичный «не стыдно» перекус.",
-        "Ещё далеко до проблем.",
-        "Симпатичный порционочный формат.",
-    ],
-    "normal": [
-        "Вот это уже еда.",
-        "Плотно, но без паники.",
-        "Лимит почувствовал, но терпит.",
-        "Вкусно и заметно.",
-        "Хороший полноценный приём.",
-        "Силы есть, свободы меньше.",
-        "Норм в пределах дня.",
-        "Так можно питаться каждый день.",
-        "Плотненько, но разумно.",
-        "По-классике — еда как еда.",
-    ],
-    "heavy": [
-        "Мощный заход.",
-        "Лимит присел от неожиданности.",
-        "Это уже серьёзно.",
-        "Так ест человек, который проголодался.",
-        "Сыто, громко, внушительно.",
-        "Желудок доволен, лимит в напряге.",
-        "Ещё немного — и будет много.",
-        "Серьёзный приём.",
-        "Аппетит явно победил.",
-        "Такое лучше не повторять часто.",
-    ],
-    "huge": [
-        "Это был налёт на холодильник.",
-        "Лимит сейчас поперхнулся.",
-        "Очень мощный приём.",
-        "Праздничный объём еды.",
-        "Это был монстр-приём.",
-        "Диета уже пишет заявление.",
-        "Банкет, не иначе.",
-        "Сейчас было слишком много.",
-        "Очень тяжёлый заход.",
-        "Калории кричат от избытка.",
-    ],
-}
-
-# ------------------------------
-#   РЕАКЦИИ ПО ОСТАТКУ ЛИМИТА
-# ------------------------------
-
-REMAIN_REACTIONS = {
-    "very_safe": [
-        "Ты ещё очень далеко от края.",
-        "Лимит чистенький, как новый.",
-        "Можно есть спокойно.",
-        "Запас огромный, кайф.",
-        "Играешь на лёгком уровне.",
-        "Диета тобой довольна.",
-        "Контроль идеальный.",
-        "Плывёшь уверенно.",
-        "Запас как у танка.",
-        "Пока вообще не страшно.",
-    ],
-    "safe": [
-        "Пока всё норм, но уже с умом.",
-        "Свобода есть, но не бесконечная.",
-        "Спокойная зона.",
-        "Можно продолжать, но аккуратнее.",
-        "Пока по плану.",
-        "Немного подъел, но жить можно.",
-        "Ещё не тревожно.",
-        "Зона комфорта сохраняется.",
-        "Пока зелёный коридор.",
-        "Осторожно, но можно.",
-    ],
-    "tight": [
-        "Место заканчивается.",
-        "Это уже жёлтая зона.",
-        "Каждый кусок теперь — решение.",
-        "Лучше подумать, прежде чем есть.",
-        "Запас смешной.",
-        "Коридор очень узкий.",
-        "Лимит почти на пределе.",
-        "Ещё чуть-чуть — и всё.",
-        "Надо включать голову.",
-        "Сейчас легко перебрать.",
-    ],
-    "danger": [
-        "Лимит уже задыхается.",
-        "Ты в красной зоне.",
-        "Ещё немного — и перелёт.",
-        "Лучше остановиться.",
-        "Дальше нельзя, если хочешь минус.",
-        "Предельно опасный момент.",
-        "Ситуация критическая.",
-        "Сегодня уже тяжело.",
-        "Лимит на последнем издыхании.",
-        "Дальше вредно для прогресса.",
-    ],
-    "doom": [
-        "Лимит кончился, день улетел.",
-        "Чистый перелёт.",
-        "Сегодня плюс по калориям.",
-        "Срыв по лимиту уверенный.",
-        "Диета сегодня проиграла.",
-        "Весы уже плачут.",
-        "Полетели за грань.",
-        "Этот день точно не про дефицит.",
-        "Перебор очевиден.",
-        "Выход в космос по калориям.",
-    ],
-}
+def get_user_limit(user_id: int) -> int:
+    return user_limits.get(user_id, DEFAULT_LIMIT)
 
 
-def choose_meal_grade(cal):
-    if cal < 80:
-        return "tiny"
-    elif cal < 200:
-        return "light"
-    elif cal < 450:
-        return "normal"
-    elif cal < 800:
-        return "heavy"
-    return "huge"
+def add_calories(user_id: int, amount: int) -> tuple[int, int]:
+    """
+    Добавляет amount к сегодняшним калориям пользователя.
+    Возвращает (использовано, осталось).
+    """
+    date_str = today_key()
+
+    if date_str not in daily_calories:
+        daily_calories[date_str] = {}
+
+    used = daily_calories[date_str].get(user_id, 0)
+    used += amount
+    daily_calories[date_str][user_id] = used
+
+    limit = get_user_limit(user_id)
+    remaining = limit - used
+    return used, remaining
 
 
-def choose_remain_grade(remain, limit):
-    used = limit - remain
-
-    ratio = used / limit if limit > 0 else 1
-
-    if ratio < 0.25:
-        return "very_safe"
-    elif ratio < 0.55:
-        return "safe"
-    elif ratio < 0.8:
-        return "tight"
-    elif ratio < 1:
-        return "danger"
-    return "doom"
+def reset_today_for_user(user_id: int):
+    """Сбросить только сегодняшний день для пользователя."""
+    date_str = today_key()
+    if date_str in daily_calories and user_id in daily_calories[date_str]:
+        del daily_calories[date_str][user_id]
+        if not daily_calories[date_str]:
+            del daily_calories[date_str]
 
 
-# ------------------------------
-#        КОМАНДЫ БОТА
-# ------------------------------
+# ---------- РЕАКЦИИ ----------
 
-@dp.message(Command("set"))
-async def set_limit(message: types.Message):
+def pick_reaction_by_meal(cal: int) -> str:
+    c = cal
+    if c <= 50:
+        pool = [
+            "Это что, калории или опечатка?",
+            "Микро-перекус для совести.",
+            "Организм даже не заметил.",
+            "Так ты больше потратил, печатая сообщение.",
+            "Диета не поняла, было что-то или нет.",
+        ]
+    elif c <= 150:
+        pool = [
+            "Лёгкий заход, как раз разогреться.",
+            "Чисто разминка для желудка.",
+            "Так скромно, будто ты ангел.",
+            "Перекус уровня «я почти молодец».",
+            "Желудок сказал «ок, продолжай».",
+        ]
+    elif c <= 300:
+        pool = [
+            "Нормальный такой перекус, без драмы.",
+            "Середнячок — ни стыдно, ни гордиться.",
+            "Так ест человек, который ещё контролирует ситуацию.",
+            "Баланс между вкусно и разумно.",
+            "Плотненько, но без фанатизма.",
+        ]
+    elif c <= 600:
+        pool = [
+            "Плотно сел, плотнее жить будешь.",
+            "Желудок аплодирует стоя.",
+            "Это уже серьёзный приём, а не «перекусик».",
+            "Так едят люди с планом.",
+            "Организм такой: «Спасибо, можно запомнить».",
+        ]
+    elif c <= 900:
+        pool = [
+            "Вот это ты зарядился.",
+            "Желудок только что подписал контракт на работу.",
+            "Калории сейчас такие: «мы в деле».",
+            "Порция уровня «живу один раз».",
+            "Диета тихо вышла из чата.",
+        ]
+    else:
+        pool = [
+            "Это было блюдо или босс-рейд?",
+            "Калории сейчас оформляют ипотеку в твоём теле.",
+            "Так едят перед зимней спячкой.",
+            "С таким приёмом пищи можно еду на завтра отменять.",
+            "Желудок попросил автограф.",
+        ]
+    return random.choice(pool)
+
+
+def pick_reaction_by_remaining(remaining: int, limit: int) -> str:
+    used = limit - remaining
+    if remaining <= 0:
+        pool = [
+            "Лимит официально закончен, поздравляю… или сочувствую.",
+            "Всё, калорийный кредит, дальше в долг.",
+            "На сегодня ты уже в овердрафте.",
+            "Диета хлопнула дверью и ушла.",
+            "Счётчик сказал: «я устал, я ухожу».",
+        ]
+    else:
+        fill = used / limit
+        if fill < 0.25:
+            pool = [
+                "Запас дикий, можно жить спокойно.",
+                "Ты ещё даже не начал, по сути.",
+                "Лимит смотрит на тебя с уважением.",
+                "Диета тобой довольна, можешь хрустеть салатиком.",
+                "Калорий почти нет, одни амбиции.",
+            ]
+        elif fill < 0.5:
+            pool = [
+                "Уже что-то поел, но без паники.",
+                "Экватор ещё впереди, можно не нервничать.",
+                "Лимит такой: «я чувствую лёгкий тик, но пока норм».",
+                "Контроль есть, и это видно.",
+                "Серединка на половинку — живём.",
+            ]
+        elif fill < 0.75:
+            pool = [
+                "Вот сейчас уже начинается интересное.",
+                "Лимит слегка напрягся, но держится.",
+                "Ещё ок, но вторая половина дня смотрит с подозрением.",
+                "Диета нервно закурила, но пока не ушла.",
+                "До края ещё есть место, но не разгоняйся.",
+            ]
+        else:
+            pool = [
+                "Очень аккуратно, ты почти у края.",
+                "Ещё один такой заход — и всё.",
+                "Лимит уже собирает чемоданы.",
+                "Диета висит на занавеске и кричит.",
+                "Калорийный потолок уже стучит по голове.",
+            ]
+    return random.choice(pool)
+
+
+def build_reply_text(cal: int, remaining: int, limit: int) -> str:
+    # случайно выбираем тип реакции
+    if random.choice([True, False]):
+        react = pick_reaction_by_meal(cal)
+    else:
+        react = pick_reaction_by_remaining(remaining, limit)
+
+    sign = "-" if cal >= 0 else "+"
+    cal_abs = abs(cal)
+    return f"{sign}{cal_abs} ккал. Осталось {max(remaining, 0)}. {react}"
+
+
+# ---------- ХЕНДЛЕРЫ ----------
+
+@dp.message_handler(Command("start"))
+async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    username = message.from_user.username or message.from_user.full_name
+
+    if user_id not in user_limits:
+        user_limits[user_id] = DEFAULT_LIMIT
+        save_data()
+
+    await message.answer(
+        f"Привет, {username}!\n"
+        f"Я считаю калории. Твой лимит: {user_limits[user_id]} ккал в день.\n\n"
+        f"Просто пиши мне вроде: <code>350</code>, <code>800 ккал</code> и т.п.\n"
+        f"Команды:\n"
+        f"/setlimit 2200 — изменить лимит\n"
+        f"/today — показать итоги за сегодня\n"
+        f"/reset_today — обнулить сегодняшний день"
+    )
+
+
+@dp.message_handler(Command("setlimit"))
+async def cmd_setlimit(message: types.Message):
+    user_id = message.from_user.id
     parts = message.text.split()
+
     if len(parts) < 2:
-        await message.answer("Формат: /set 2000 или /set 2000 @username")
+        await message.answer("Напиши так: /setlimit 2000")
         return
 
     try:
-        limit = int(parts[1])
-    except:
-        await message.answer("Пожалуйста, укажи число.")
+        new_limit = int(parts[1])
+    except ValueError:
+        await message.answer("Лимит должен быть числом, например: /setlimit 1800")
         return
 
-    data = load_data()
-    today = get_today()
-
-    if today not in data:
-        data[today] = {}
-
-    # если указан другой пользователь
-    if len(parts) == 3:
-        target = parts[2]
-    else:
-        target = message.from_user.username or str(message.from_user.id)
-
-    if target not in data[today]:
-        data[today][target] = {"limit": limit, "used": 0}
-    else:
-        data[today][target]["limit"] = limit
-
-    save_data(data)
-    await message.answer(f"Лимит для {target} установлен: {limit} ккал.")
-
-
-@dp.message()
-async def log_calories(message: types.Message):
-    text = message.text.lower().replace(" ", "")
-    if not text.endswith("ккал"):
+    if new_limit <= 0:
+        await message.answer("Лимит должен быть положительным числом.")
         return
 
-    try:
-        calories = int(text.replace("ккал", ""))
-    except:
+    user_limits[user_id] = new_limit
+    save_data()
+
+    username = message.from_user.username or message.from_user.full_name
+    await message.answer(f"Лимит для {username} установлен: {new_limit} ккал.")
+
+
+@dp.message_handler(Command("today"))
+async def cmd_today(message: types.Message):
+    user_id = message.from_user.id
+    date_str = today_key()
+    used = daily_calories.get(date_str, {}).get(user_id, 0)
+    limit = get_user_limit(user_id)
+    remaining = limit - used
+
+    await message.answer(
+        f"Сегодня ты уже набрал {used} ккал.\n"
+        f"Лимит: {limit} ккал.\n"
+        f"Осталось: {max(remaining, 0)} ккал."
+    )
+
+
+@dp.message_handler(Command("reset_today"))
+async def cmd_reset_today(message: types.Message):
+    user_id = message.from_user.id
+    reset_today_for_user(user_id)
+    save_data()
+    await message.answer("Сегодняшний счётчик калорий обнулён.")
+
+
+@dp.message_handler()
+async def handle_calories(message: types.Message):
+    user_id = message.from_user.id
+
+    # ищем первое число в сообщении
+    text = message.text.replace(",", ".")
+    parts = text.split()
+    cal = None
+    for p in parts:
+        try:
+            cal = int(float(p))
+            break
+        except ValueError:
+            continue
+
+    if cal is None:
+        await message.answer("Не понял, сколько ккал. Напиши просто число, например: 350")
         return
 
-    user_key = message.from_user.username or str(message.from_user.id)
+    # не даём увести в ад странными значениями
+    if abs(cal) > 5000:
+        await message.answer("Слишком странное число калорий, давай что-то реальнее :)")
+        return
 
-    data = load_data()
-    today = get_today()
+    used, remaining = add_calories(user_id, cal)
+    limit = get_user_limit(user_id)
+    save_data()
 
-    if today not in data:
-        data[today] = {}
-
-    if user_key not in data[today]:
-        data[today][user_key] = {"limit": 2000, "used": 0}
-
-    data[today][user_key]["used"] += calories
-    limit = data[today][user_key]["limit"]
-    used = data[today][user_key]["used"]
-    remain = limit - used
-
-    # выбираем тип реакции
-    pick = random.choice(["meal", "remain"])
-
-    if pick == "meal":
-        grade = choose_meal_grade(calories)
-        reaction = random.choice(MEAL_REACTIONS[grade])
-    else:
-        grade = choose_remain_grade(remain, limit)
-        reaction = random.choice(REMAIN_REACTIONS[grade])
-
-    save_data(data)
-
-    if remain >= 0:
-        await message.answer(f"-{calories} ккал. Осталось {remain}. {reaction}")
-    else:
-        await message.answer(f"-{calories} ккал. Перебор на {abs(remain)}. {reaction}")
-
-
-# ------------------------------
-#   ЕЖЕДНЕВНЫЙ СБРОС В 06:00
-# ------------------------------
-
-async def reset_daily():
-    while True:
-        now = datetime.now(TZ)
-        target = now.replace(hour=6, minute=0, second=0, microsecond=0)
-
-        if now >= target:
-            target += timedelta(days=1)
-
-        wait_seconds = (target - now).total_seconds()
-        await asyncio.sleep(wait_seconds)
-
-        today = get_today()
-        save_data({today: {}})
-
-
-async def main():
-    asyncio.create_task(reset_daily())
-    await dp.start_polling(bot)
+    reply = build_reply_text(cal, remaining, limit)
+    await message.answer(reply)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    load_data()
+    executor.start_polling(dp, skip_updates=True)
