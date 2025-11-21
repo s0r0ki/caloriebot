@@ -1,250 +1,308 @@
-import os
+import asyncio
+import logging
 import json
-import random
-from datetime import datetime
+import os
+from datetime import datetime, time, timedelta
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import Command
 import pytz
+import random
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-)
+logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.getenv("TELEGRAM_TOKEN")
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
 
-DATA_FILE = "users.json"
-TZ = pytz.timezone("Europe/Moscow")  # можешь сменить на свой часовой пояс
+DATA_FILE = "calories.json"
+TZ = pytz.timezone("Europe/Moscow")
 
-
-# ====== Хранение данных ======
 
 def load_data():
     if not os.path.exists(DATA_FILE):
         return {}
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
 
 
 def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
 
-def make_key(chat_id: int, user_id: int) -> str:
-    # ключ — пара чат+юзер
-    return f"{chat_id}:{user_id}"
+def get_today():
+    return datetime.now(TZ).strftime("%Y-%m-%d")
 
 
-def get_key(update: Update) -> str:
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    return make_key(chat_id, user_id)
+# ------------------------------
+#     РЕАКЦИИ НА ОБЪЁМ ЕДЫ
+# ------------------------------
+
+MEAL_REACTIONS = {
+    "tiny": [
+        "Это было не еда, а тест-драйв.",
+        "Перекус-призрак.",
+        "Лимит даже не заметил.",
+        "Так ест человек с характером.",
+        "Можно считать, что «ничего не было».",
+        "Организм такой: «и всё?»",
+        "Диета довольно улыбается.",
+        "Аккуратненько, красиво.",
+        "Лёгкий шаг, а не еда.",
+        "Просто размял желудок.",
+    ],
+    "light": [
+        "Лёгкий заход, лимит не в стрессе.",
+        "Нормальный скромный приём.",
+        "Поел — но без последствий.",
+        "Чистый, спокойный ход.",
+        "Пока всё под контролем.",
+        "Диета не напрягается.",
+        "Умерено, приятно, не страшно.",
+        "Типичный «не стыдно» перекус.",
+        "Ещё далеко до проблем.",
+        "Симпатичный порционочный формат.",
+    ],
+    "normal": [
+        "Вот это уже еда.",
+        "Плотно, но без паники.",
+        "Лимит почувствовал, но терпит.",
+        "Вкусно и заметно.",
+        "Хороший полноценный приём.",
+        "Силы есть, свободы меньше.",
+        "Норм в пределах дня.",
+        "Так можно питаться каждый день.",
+        "Плотненько, но разумно.",
+        "По-классике — еда как еда.",
+    ],
+    "heavy": [
+        "Мощный заход.",
+        "Лимит присел от неожиданности.",
+        "Это уже серьёзно.",
+        "Так ест человек, который проголодался.",
+        "Сыто, громко, внушительно.",
+        "Желудок доволен, лимит в напряге.",
+        "Ещё немного — и будет много.",
+        "Серьёзный приём.",
+        "Аппетит явно победил.",
+        "Такое лучше не повторять часто.",
+    ],
+    "huge": [
+        "Это был налёт на холодильник.",
+        "Лимит сейчас поперхнулся.",
+        "Очень мощный приём.",
+        "Праздничный объём еды.",
+        "Это был монстр-приём.",
+        "Диета уже пишет заявление.",
+        "Банкет, не иначе.",
+        "Сейчас было слишком много.",
+        "Очень тяжёлый заход.",
+        "Калории кричат от избытка.",
+    ],
+}
+
+# ------------------------------
+#   РЕАКЦИИ ПО ОСТАТКУ ЛИМИТА
+# ------------------------------
+
+REMAIN_REACTIONS = {
+    "very_safe": [
+        "Ты ещё очень далеко от края.",
+        "Лимит чистенький, как новый.",
+        "Можно есть спокойно.",
+        "Запас огромный, кайф.",
+        "Играешь на лёгком уровне.",
+        "Диета тобой довольна.",
+        "Контроль идеальный.",
+        "Плывёшь уверенно.",
+        "Запас как у танка.",
+        "Пока вообще не страшно.",
+    ],
+    "safe": [
+        "Пока всё норм, но уже с умом.",
+        "Свобода есть, но не бесконечная.",
+        "Спокойная зона.",
+        "Можно продолжать, но аккуратнее.",
+        "Пока по плану.",
+        "Немного подъел, но жить можно.",
+        "Ещё не тревожно.",
+        "Зона комфорта сохраняется.",
+        "Пока зелёный коридор.",
+        "Осторожно, но можно.",
+    ],
+    "tight": [
+        "Место заканчивается.",
+        "Это уже жёлтая зона.",
+        "Каждый кусок теперь — решение.",
+        "Лучше подумать, прежде чем есть.",
+        "Запас смешной.",
+        "Коридор очень узкий.",
+        "Лимит почти на пределе.",
+        "Ещё чуть-чуть — и всё.",
+        "Надо включать голову.",
+        "Сейчас легко перебрать.",
+    ],
+    "danger": [
+        "Лимит уже задыхается.",
+        "Ты в красной зоне.",
+        "Ещё немного — и перелёт.",
+        "Лучше остановиться.",
+        "Дальше нельзя, если хочешь минус.",
+        "Предельно опасный момент.",
+        "Ситуация критическая.",
+        "Сегодня уже тяжело.",
+        "Лимит на последнем издыхании.",
+        "Дальше вредно для прогресса.",
+    ],
+    "doom": [
+        "Лимит кончился, день улетел.",
+        "Чистый перелёт.",
+        "Сегодня плюс по калориям.",
+        "Срыв по лимиту уверенный.",
+        "Диета сегодня проиграла.",
+        "Весы уже плачут.",
+        "Полетели за грань.",
+        "Этот день точно не про дефицит.",
+        "Перебор очевиден.",
+        "Выход в космос по калориям.",
+    ],
+}
 
 
-def reset_if_needed(user: dict):
-    """
-    Сброс лимита один раз в день после 6 утра по TZ.
-    """
-    now = datetime.now(TZ)
-    today = now.strftime("%Y-%m-%d")
-
-    if user.get("last_reset") != today and now.hour >= 6:
-        user["remaining"] = user.get("daily", user.get("remaining", 0))
-        user["last_reset"] = today
-
-
-# ====== Реакции ======
-
-REACTIONS_OK = [
-    "Живём! 💪",
-    "Можно ещё чуть-чуть 😏",
-    "Нормально идёшь 🐢",
-    "Пока без паники 🔥",
-    "Диетолог тобой бы гордился(а) 🩺",
-    "Ещё не конец света 🌍",
-    "Калории дрожат от страха, но ты молодец 😎",
-]
-
-REACTIONS_OVER = [
-    "Ну всё, пошли в зал… когда-нибудь 🏋️‍♂️",
-    "Мы это… делали вид, что не видели 😶",
-    "Лимит: *я устал, я ухожу* 🚪",
-    "Организм: *алё, ты серьёзно?* 📞",
-    "Калории такие: «он(а) не остановится…» 😱",
-    "Это был вкусный бунт против системы 🤷‍♂️",
-]
+def choose_meal_grade(cal):
+    if cal < 80:
+        return "tiny"
+    elif cal < 200:
+        return "light"
+    elif cal < 450:
+        return "normal"
+    elif cal < 800:
+        return "heavy"
+    return "huge"
 
 
-def add_reaction(base_text: str, over: bool = False) -> str:
-    if over:
-        r = random.choice(REACTIONS_OVER)
+def choose_remain_grade(remain, limit):
+    used = limit - remain
+
+    ratio = used / limit if limit > 0 else 1
+
+    if ratio < 0.25:
+        return "very_safe"
+    elif ratio < 0.55:
+        return "safe"
+    elif ratio < 0.8:
+        return "tight"
+    elif ratio < 1:
+        return "danger"
+    return "doom"
+
+
+# ------------------------------
+#        КОМАНДЫ БОТА
+# ------------------------------
+
+@dp.message(Command("set"))
+async def set_limit(message: types.Message):
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Формат: /set 2000 или /set 2000 @username")
+        return
+
+    try:
+        limit = int(parts[1])
+    except:
+        await message.answer("Пожалуйста, укажи число.")
+        return
+
+    data = load_data()
+    today = get_today()
+
+    if today not in data:
+        data[today] = {}
+
+    # если указан другой пользователь
+    if len(parts) == 3:
+        target = parts[2]
     else:
-        r = random.choice(REACTIONS_OK)
-    return f"{base_text}\n\n{r}"
+        target = message.from_user.username or str(message.from_user.id)
 
-
-# ====== Команды ======
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "Привет! Я считаю калории в этом чате 🍽\n\n"
-        "Как пользоваться:\n"
-        "1️⃣ Задай свой лимит: /set 2000\n"
-        "2️⃣ Пиши сообщения вида: 300ккал\n"
-        "   (без пробелов, можно в любом месте чата)\n"
-        "3️⃣ Я буду вычитать и писать, сколько осталось.\n\n"
-        "Для другого человека:\n"
-        "— ответь на его сообщение и напиши: /setfor 1800\n\n"
-        "Посмотреть остаток: /status"
-    )
-    await update.message.reply_text(text)
-
-
-async def set_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) != 1 or not args[0].isdigit():
-        await update.message.reply_text("Использование: /set 2000")
-        return
-
-    limit = int(args[0])
-    data = load_data()
-    key = get_key(update)
-    now = datetime.now(TZ).strftime("%Y-%m-%d")
-
-    data[key] = {
-        "daily": limit,
-        "remaining": limit,
-        "last_reset": now,
-    }
+    if target not in data[today]:
+        data[today][target] = {"limit": limit, "used": 0}
+    else:
+        data[today][target]["limit"] = limit
 
     save_data(data)
-    msg = f"Твой дневной лимит установлен: {limit} ккал"
-    await update.message.reply_text(add_reaction(msg, over=False))
+    await message.answer(f"Лимит для {target} установлен: {limit} ккал.")
 
 
-async def set_for_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /setfor 1800 в ответ на сообщение другого человека.
-    """
-    if not update.message:
-        return
-
-    if not update.message.reply_to_message:
-        await update.message.reply_text(
-            "Сделай реплай на сообщение человека и напиши: /setfor 1800"
-        )
-        return
-
-    args = context.args
-    if len(args) != 1 or not args[0].isdigit():
-        await update.message.reply_text("Использование: /setfor 1800 (в ответ на сообщение)")
-        return
-
-    limit = int(args[0])
-
-    target_user = update.message.reply_to_message.from_user
-    chat_id = update.effective_chat.id
-    key = make_key(chat_id, target_user.id)
-
-    data = load_data()
-    now = datetime.now(TZ).strftime("%Y-%m-%d")
-
-    data[key] = {
-        "daily": limit,
-        "remaining": limit,
-        "last_reset": now,
-    }
-
-    save_data(data)
-
-    name = target_user.first_name or "пользователь"
-    msg = f"Лимит для {name} установлен: {limit} ккал"
-    await update.message.reply_text(add_reaction(msg, over=False))
-
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = load_data()
-    key = get_key(update)
-
-    if key not in data:
-        await update.message.reply_text("Сначала задай лимит: /set 2000")
-        return
-
-    user = data[key]
-    reset_if_needed(user)
-    save_data(data)
-
-    msg = (
-        f"Твой дневной лимит: {user['daily']} ккал\n"
-        f"Осталось на сегодня: {user['remaining']} ккал"
-    )
-    over = user["remaining"] < 0
-    await update.message.reply_text(add_reaction(msg, over=over))
-
-
-# ====== Обработка сообщений с '...ккал' ======
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-
-    text = update.message.text.lower().replace(" ", "")
-
-    # ждём формат типа "300ккал"
+@dp.message()
+async def log_calories(message: types.Message):
+    text = message.text.lower().replace(" ", "")
     if not text.endswith("ккал"):
         return
 
-    num = text[:-4]
-    if not num.isdigit():
+    try:
+        calories = int(text.replace("ккал", ""))
+    except:
         return
 
-    amount = int(num)
+    user_key = message.from_user.username or str(message.from_user.id)
 
     data = load_data()
-    key = get_key(update)
+    today = get_today()
 
-    if key not in data:
-        await update.message.reply_text("Сначала задай лимит: /set 2000")
-        return
+    if today not in data:
+        data[today] = {}
 
-    user = data[key]
-    reset_if_needed(user)
+    if user_key not in data[today]:
+        data[today][user_key] = {"limit": 2000, "used": 0}
 
-    user["remaining"] -= amount
+    data[today][user_key]["used"] += calories
+    limit = data[today][user_key]["limit"]
+    used = data[today][user_key]["used"]
+    remain = limit - used
+
+    # выбираем тип реакции
+    pick = random.choice(["meal", "remain"])
+
+    if pick == "meal":
+        grade = choose_meal_grade(calories)
+        reaction = random.choice(MEAL_REACTIONS[grade])
+    else:
+        grade = choose_remain_grade(remain, limit)
+        reaction = random.choice(REMAIN_REACTIONS[grade])
+
     save_data(data)
 
-    if user["remaining"] >= 0:
-        msg = f"Осталось: {user['remaining']} ккал"
-        await update.message.reply_text(add_reaction(msg, over=False))
+    if remain >= 0:
+        await message.answer(f"-{calories} ккал. Осталось {remain}. {reaction}")
     else:
-        msg = f"Ты превысил лимит на {-user['remaining']} ккал!"
-        await update.message.reply_text(add_reaction(msg, over=True))
+        await message.answer(f"-{calories} ккал. Перебор на {abs(remain)}. {reaction}")
 
 
-# ====== Запуск приложения ======
+# ------------------------------
+#   ЕЖЕДНЕВНЫЙ СБРОС В 06:00
+# ------------------------------
 
-def main():
-    if not TOKEN:
-        raise RuntimeError("Переменная окружения TELEGRAM_TOKEN не задана")
+async def reset_daily():
+    while True:
+        now = datetime.now(TZ)
+        target = now.replace(hour=6, minute=0, second=0, microsecond=0)
 
-    application = Application.builder().token(TOKEN).build()
+        if now >= target:
+            target += timedelta(days=1)
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("set", set_limit))
-    application.add_handler(CommandHandler("setfor", set_for_other))
-    application.add_handler(CommandHandler("status", status))
-    application.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
-    )
+        wait_seconds = (target - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
 
-    application.run_polling()
+        today = get_today()
+        save_data({today: {}})
+
+
+async def main():
+    asyncio.create_task(reset_daily())
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
